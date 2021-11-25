@@ -1,0 +1,120 @@
+CREATE MATERIALIZED VIEW mimiciii.gj_gcs_132pats AS
+--获取132位创伤+sofa（第一天）患者入院阶段所有的gcs记录  并取最小值
+WITH
+pvt as(
+    SELECT
+            l.icustay_id,
+            l.subject_id,
+                 CASE
+                     WHEN l.itemid = ANY (ARRAY [723, 223900]) THEN 723
+                     WHEN l.itemid = ANY (ARRAY [454, 223901]) THEN 454
+                     WHEN l.itemid = ANY (ARRAY [184, 220739]) THEN 184
+                     ELSE l.itemid
+                     END AS itemid,
+                 CASE
+                     WHEN l.itemid = 723 AND l.value::text = '1.0 ET/Trach'::text THEN 0::double precision
+                     WHEN l.itemid = 223900 AND l.value::text = 'No Response-ETT'::text THEN 0::double precision
+                     ELSE l.valuenum
+                     END AS valuenum,
+                 l.charttime
+             FROM
+                 mimiciii.chartevents l
+                     JOIN mimiciii.gj_132pats b ON l.icustay_id = b.icustay_id and l.subject_id = b.subject_id
+             WHERE
+                   (l.itemid = ANY (ARRAY [184, 454, 723, 223900, 223901, 220739]))
+               AND l.charttime >= b.intime
+               AND l.error IS DISTINCT FROM 1
+),
+    base AS (
+        SELECT
+            pvt.icustay_id,
+            pvt.charttime,
+
+                    CASE
+                        WHEN pvt.itemid = 454 THEN pvt.valuenum
+                        ELSE NULL::double precision
+                        END                                                     AS gcsmotor,
+
+                    CASE
+                        WHEN pvt.itemid = 723 THEN pvt.valuenum
+                        ELSE NULL::double precision
+                        END                                                      AS gcsverbal,
+
+                    CASE
+                        WHEN pvt.itemid = 184 THEN pvt.valuenum
+                        ELSE NULL::double precision
+                        END                                                       AS gcseyes,
+            CASE
+                WHEN
+                             CASE
+                                 WHEN pvt.itemid = 723 THEN pvt.valuenum
+                                 ELSE NULL::double precision
+                                 END = 0::double precision THEN 1
+                ELSE 0
+                END                                                                AS endotrachflag,
+            row_number() OVER (PARTITION BY pvt.icustay_id ORDER BY pvt.charttime) AS rn
+            FROM pvt
+    ),
+    gcs AS (
+        SELECT
+            b.icustay_id,
+            b.charttime,
+            b.gcsmotor,
+            b.gcsverbal,
+            b.gcseyes,
+            b.endotrachflag,
+            b.rn,
+            b2.gcsverbal AS gcsverbalprev,
+            b2.gcsmotor  AS gcsmotorprev,
+            b2.gcseyes   AS gcseyesprev,
+            CASE
+                WHEN b.gcsverbal = 0::double precision THEN 15::double precision
+                WHEN b.gcsverbal IS NULL AND b2.gcsverbal = 0::double precision THEN 15::double precision
+                WHEN b2.gcsverbal = 0::double precision THEN COALESCE(b.gcsmotor, 6::double precision) +
+                                                             COALESCE(b.gcsverbal, 5::double precision) +
+                                                             COALESCE(b.gcseyes, 4::double precision)
+                ELSE COALESCE(b.gcsmotor, COALESCE(b2.gcsmotor, 6::double precision)) +
+                     COALESCE(b.gcsverbal, COALESCE(b2.gcsverbal, 5::double precision)) +
+                     COALESCE(b.gcseyes, COALESCE(b2.gcseyes, 4::double precision))
+                END      AS gcs
+        FROM
+            base b
+                LEFT JOIN base b2 ON b.icustay_id = b2.icustay_id AND b.rn = (b2.rn + 1) AND
+                                     b2.charttime > (b.charttime - '06:00:00'::interval HOUR)
+    ),
+
+    gcs_final AS (
+        SELECT
+            gcs.icustay_id,
+            gcs.charttime,
+            gcs.gcsmotor,
+            gcs.gcsverbal,
+            gcs.gcseyes,
+            gcs.endotrachflag,
+            gcs.rn,
+            gcs.gcsverbalprev,
+            gcs.gcsmotorprev,
+            gcs.gcseyesprev,
+            gcs.gcs,
+            row_number() OVER (PARTITION BY gcs.charttime ORDER BY gcs.gcs) AS ismingcs
+        FROM
+            gcs
+    )
+SELECT
+    ie.subject_id,
+    ie.hadm_id,
+    ie.icustay_id,
+    gs.charttime,
+    gs.gcs                                   AS mingcs,
+    COALESCE(gs.gcsmotor, gs.gcsmotorprev)   AS gcsmotor,
+    COALESCE(gs.gcsverbal, gs.gcsverbalprev) AS gcsverbal,
+    COALESCE(gs.gcseyes, gs.gcseyesprev)     AS gcseyes,
+    gs.endotrachflag
+FROM
+    mimiciii.gj_132pats ie
+        LEFT JOIN gcs_final gs ON ie.icustay_id = gs.icustay_id
+                                      AND gs.ismingcs = 1
+ORDER BY
+    ie.icustay_id,gs.charttime;
+
+
